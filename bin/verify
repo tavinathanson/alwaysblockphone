@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Read-only check of a connected Android/GrapheneOS device against the AlwaysBlockPhone policy.
+#
+# Usage: bin/verify [--expect-device CODENAME]
+#
+# Only runs read-only queries (getprop, pm list, settings get). It never installs,
+# uninstalls, disables, wipes, flashes, or changes any setting. If more than one device is
+# connected, set ANDROID_SERIAL to pick one.
+#
+# Exit codes: 0 = no violations, 1 = policy violations found, 2 = could not check.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+APP_PACKAGE="io.github.tavinathanson.alwaysblockphone"
+BROWSERS="app.vanadium.browser com.android.chrome org.mozilla.firefox org.mozilla.fennec_fdroid
+org.mozilla.focus com.brave.browser com.duckduckgo.mobile.android com.microsoft.emmx
+com.opera.browser com.sec.android.app.sbrowser com.kiwibrowser.browser"
+
+expect_device=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expect-device) expect_device="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+violations=0
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m⚠\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; violations=$((violations + 1)); }
+info() { printf '  · %s\n' "$*"; }
+die()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 2; }
+section() { printf '\n%s\n' "$*"; }
+# stdin from /dev/null so adb never swallows the input of a surrounding read loop.
+sh_()  { adb shell "$@" </dev/null 2>/dev/null | tr -d '\r'; }
+
+# --- Policy (same file selection as the app: local.conf overrides policy.conf) ---
+policy_file="$ROOT/policy/local.conf"
+[ -f "$policy_file" ] || policy_file="$ROOT/policy/policy.conf"
+[ -f "$policy_file" ] || die "no policy file in $ROOT/policy"
+policy="$(sed 's/#.*//' "$policy_file" | awk 'NF >= 3 { print $1, tolower($2), $3 }')"
+
+# --- Environment ---
+command -v adb >/dev/null 2>&1 || die "adb not found. Install Android platform-tools and add it to PATH."
+
+section "Device"
+states="$(adb devices 2>/dev/null | tail -n +2 | awk 'NF { print $2 }')"
+if [ -n "${ANDROID_SERIAL:-}" ]; then
+  state="$(adb get-state 2>&1 | tr -d '\r')"
+else
+  count="$(printf '%s\n' "$states" | grep -c . || true)"
+  [ "$count" -gt 1 ] && die "$count devices connected. Set ANDROID_SERIAL to choose one."
+  state="$states"
+fi
+case "$state" in
+  device) ok "device connected and authorized" ;;
+  unauthorized) die "device is unauthorized. Unlock the phone and accept the USB debugging prompt." ;;
+  "") die "no device found. Connect the phone and enable USB debugging (see docs/install-grapheneos.md)." ;;
+  *) die "device state is '$state'. Reconnect the cable and try again." ;;
+esac
+
+codename="$(sh_ getprop ro.product.device)"
+if [ -n "$expect_device" ] && [ "$codename" != "$expect_device" ]; then
+  bad "device codename is '$codename', expected '$expect_device'"
+else
+  ok "device codename: $codename"
+fi
+
+if [ "$(sh_ getprop ro.boot.flash.locked)" = "1" ]; then
+  ok "bootloader locked (verified boot state: $(sh_ getprop ro.boot.verifiedbootstate))"
+else
+  warn "bootloader is not reported as locked"
+fi
+
+if [ -n "$(sh_ pm list packages app.grapheneos.apps)" ]; then
+  ok "GrapheneOS detected (heuristic: GrapheneOS App Store present)"
+else
+  info "GrapheneOS not detected: profile checks still run, structural controls may differ"
+fi
+
+# --- Profiles and installed packages ---
+# `pm list users` prints lines like: UserInfo{0:Owner:c13} running
+users="$(sh_ pm list users | sed -n 's/.*UserInfo{\([0-9]*\):\([^:]*\):.*}\(.*\)/\1|\2|\3/p')"
+[ -n "$users" ] || die "could not list user profiles"
+
+section "Profiles"
+# Indexed by numeric user id (plain arrays: macOS ships bash 3.2, which has no associative arrays).
+installed=(); disabled=(); running=(); name=()
+while IFS='|' read -r id uname rest; do
+  name[id]="$uname"
+  state=stopped
+  case "$rest" in *running*) running[id]=1; state=running ;; esac
+  installed[id]="$(sh_ pm list packages --user "$id" | sed 's/^package://')"
+  disabled[id]="$(sh_ pm list packages -d --user "$id" | sed 's/^package://')"
+  info "user $id ($uname): $state"
+done <<< "$users"
+user_ids="$(printf '%s\n' "$users" | cut -d'|' -f1)"
+
+has()        { printf '%s\n' "${installed[$1]}" | grep -qx "$2"; }
+is_disabled(){ printf '%s\n' "${disabled[$1]}" | grep -qx "$2"; }
+users_with() { for u in $user_ids; do has "$u" "$1" && printf '%s ' "$u"; done; }
+label()      { printf 'user %s (%s)' "$1" "${name[$1]}"; }
+
+# --- Policy rules ---
+section "Policy ($(basename "$policy_file"))"
+friction_packages=""; friction_users=""
+while read -r id access pkg; do
+  where="$(users_with "$pkg")"
+  case "$access" in
+    absent)
+      if [ -z "$where" ]; then ok "$id absent from all profiles"
+      else for u in $where; do bad "$id ($pkg) is installed in $(label "$u")$(is_disabled "$u" "$pkg" && echo ', disabled')"; done
+      fi ;;
+    friction)
+      friction_packages="$friction_packages $pkg"
+      [ -z "$where" ] && info "$id not installed in any profile"
+      for u in $where; do
+        if is_disabled "$u" "$pkg"; then ok "$id in $(label "$u") is disabled, so it cannot run"; continue; fi
+        [ "$u" = "0" ] && warn "$id is in the Owner profile; a separate profile adds structural friction"
+        if ! has "$u" "$APP_PACKAGE"; then
+          bad "$id is in $(label "$u") but the AlwaysBlockPhone app is not"
+        elif sh_ settings --user "$u" get secure enabled_accessibility_services | grep -q "$APP_PACKAGE"; then
+          ok "$id in $(label "$u") is guarded by the AlwaysBlockPhone accessibility service"
+        elif [ -n "${running[$u]:-}" ]; then
+          bad "$id is in $(label "$u") but the AlwaysBlockPhone accessibility service is off there"
+        else
+          warn "$id in $(label "$u"): profile is stopped, accessibility state not readable"
+        fi
+        friction_users="$friction_users $u"
+      done ;;
+    normal)
+      if [ -n "$where" ]; then ok "$id available (user $(echo "${where% }" | tr ' ' ','))"
+      else info "$id (normal) not installed"
+      fi ;;
+    undecided) info "$id undecided, not checked" ;;
+  esac
+done <<< "$policy"
+for u in $(echo "$friction_users" | tr ' ' '\n' | sort -un); do
+  [ "$u" != "0" ] && [ -n "${running[$u]:-}" ] && warn "$(label "$u") holds friction apps and is running; End session when done"
+done
+
+# --- Known gaps ---
+section "Bypass paths and things this cannot check"
+for b in $BROWSERS; do
+  case " $friction_packages " in *" $b "*) continue ;; esac
+  for u in $(users_with "$b"); do
+    is_disabled "$u" "$b" || warn "browser $b in $(label "$u") can still reach the web versions of blocked apps"
+  done
+done
+[ "$(sh_ settings get global development_settings_enabled)" = "1" ] && warn "Developer options are on"
+warn "USB debugging is on (it must be, for this check). When finished: revoke USB debugging authorizations, then turn USB debugging off"
+warn "account sign-in, 2FA and banking enrollment state cannot be verified from here"
+
+echo
+if [ "$violations" -gt 0 ]; then
+  printf '\033[31m%d policy violation(s)\033[0m\n' "$violations"; exit 1
+fi
+printf '\033[32mNo policy violations found\033[0m\n'

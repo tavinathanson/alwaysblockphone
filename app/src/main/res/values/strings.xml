@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AlwaysBlockPhone</string>
+    <string name="accessibility_description">Sends you to the AlwaysBlockPhone screen when an app on your friction list opens without an active access session. Only the name of the app in the foreground is used. It is never stored or sent anywhere, and the service cannot read screen content.</string>
+</resources>

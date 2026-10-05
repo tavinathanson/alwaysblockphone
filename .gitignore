@@ -1,0 +1,46 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local machine / IDE state
+local.properties
+.idea/
+*.iml
+.DS_Store
+.vscode/
+
+# Personal policy (keep your real app list off a public repo)
+policy/local.conf
+
+# Secrets and signing material: never commit these
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+.env
+*.env
+google-services.json
+
+# Device artifacts: logs, dumps, backups, screenshots, factory images
+*.log
+logcat*.txt
+bugreport*.zip
+*.ab
+backup*/
+screenshots/
+platform-tools/
+*-install-*.zip
+*-install-*.zip.sig
+*-install-*/
+allowed_signers
+platform-tools_*.zip

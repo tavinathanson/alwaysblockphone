@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and below. Session state stays on this device. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>
